@@ -1,0 +1,460 @@
+/*
+ * AD7960 + AXI DMA + lwIP UDP sender (based on Xilinx lwIP echo template)
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "xparameters.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "xstatus.h"
+#include "xil_io.h"
+
+#include "netif/xadapter.h"
+#include "platform.h"
+#include "platform_config.h"
+
+#include "xaxidma.h"
+
+#include "lwip/tcp.h"
+#include "lwip/udp.h"
+#include "lwip/ip_addr.h"
+
+#if LWIP_IPV6==1
+#include "lwip/ip.h"
+#else
+#if LWIP_DHCP==1
+#include "lwip/dhcp.h"
+#endif
+#endif
+
+/* ====== 기존 echo 템플릿에서 쓰던 전역/함수 선언 ====== */
+
+/* missing declaration in lwIP */
+void lwip_init();
+
+#if LWIP_IPV6==0
+#if LWIP_DHCP==1
+extern volatile int dhcp_timoutcntr;
+err_t dhcp_start(struct netif *netif);
+#endif
+#endif
+
+extern volatile int TcpFastTmrFlag;
+extern volatile int TcpSlowTmrFlag;
+
+static struct netif server_netif;
+struct netif *echo_netif;
+
+/* IP 출력 유틸 (IPv4) */
+#if LWIP_IPV6==0
+void print_ip(char *msg, ip_addr_t *ip)
+{
+    print(msg);
+    xil_printf("%d.%d.%d.%d\n\r", ip4_addr1(ip), ip4_addr2(ip),
+               ip4_addr3(ip), ip4_addr4(ip));
+}
+
+void print_ip_settings(ip_addr_t *ip, ip_addr_t *mask, ip_addr_t *gw)
+{
+    print_ip("Board IP: ", ip);
+    print_ip("Netmask : ", mask);
+    print_ip("Gateway : ", gw);
+}
+#endif
+
+/* ====== AD7960 + DMA 설정 ====== */
+
+#define DMA_DEV_ID          XPAR_AXIDMA_0_DEVICE_ID
+
+/* AD7960: 18bit bipolar, Vref = 4.096V → 4096mV, full-scale = ±FS */
+#define ADC_VREF_MV         5000
+#define ADC_FS_DIV          131072    /* 2^(18-1) */
+
+#define FRAME_SAMPLES       8U
+#define BYTES_PER_SAMPLE    4U
+#define FRAME_BYTE_LEN      (FRAME_SAMPLES * BYTES_PER_SAMPLE)
+
+/* 더블 버퍼 (DDR) */
+#define RX_BUFFER_BASE_A    0x01000000U
+#define RX_BUFFER_BASE_B    (RX_BUFFER_BASE_A + FRAME_BYTE_LEN)
+
+static XAxiDma AxiDma;
+
+/* ====== UDP 송신 관련 ====== */
+
+static struct udp_pcb *udp_tx_pcb = NULL;
+static ip_addr_t dest_ip;
+static u16_t dest_port = 5005;   /* H4에서 받을 포트 */
+
+/* ====== ADC 코드/전압 변환 ====== */
+
+static int32_t adc_code_from_raw(u32 raw)
+{
+    /* 하위 18bit 사용 */
+    u32 code18 = raw & 0x3FFFFU;
+
+    /* sign extend */
+    if (code18 & 0x20000U) {
+        return (int32_t)(code18 | ~0x3FFFFU);
+    } else {
+        return (int32_t)code18;
+    }
+}
+
+static int32_t adc_code_to_mv(int32_t code)
+{
+    /* code → mV (int64_t 사용해서 overflow 방지) */
+    return (int32_t)(((int64_t)code * ADC_VREF_MV) / ADC_FS_DIV);
+}
+
+/* ====== DMA 초기화/제어 ====== */
+
+static int init_dma(void)
+{
+    int Status;
+    XAxiDma_Config *CfgPtr;
+
+    xil_printf("Initializing DMA...\r\n");
+
+    CfgPtr = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (CfgPtr == NULL) {
+        xil_printf("No DMA config found!\r\n");
+        return XST_FAILURE;
+    }
+
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA init failed! status = %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("Error: DMA is in SG mode! Need Simple mode.\r\n");
+        return XST_FAILURE;
+    }
+
+    xil_printf("DMA init OK. RegBase=0x%08lx\r\n", AxiDma.RegBase);
+    return XST_SUCCESS;
+}
+
+/* S2MM 채널 리셋 + 에러 플래그 클리어 (초기 1회만 호출) */
+static void reset_s2mm(void)
+{
+    xil_printf("Resetting S2MM channel...\r\n");
+
+    u32 s2mm_sr =
+        XAxiDma_ReadReg(AxiDma.RegBase + XAXIDMA_RX_OFFSET, XAXIDMA_SR_OFFSET);
+
+    /* 에러 비트 있으면 클리어 */
+    if (s2mm_sr & XAXIDMA_ERR_ALL_MASK) {
+        XAxiDma_WriteReg(AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                         XAXIDMA_SR_OFFSET,
+                         s2mm_sr | XAXIDMA_ERR_ALL_MASK);
+        xil_printf("S2MM error flags cleared (before reset).\r\n");
+    }
+
+    XAxiDma_Reset(&AxiDma);
+    while (!XAxiDma_ResetIsDone(&AxiDma)) {
+        /* busy wait */
+    }
+    xil_printf("S2MM reset done.\r\n");
+}
+
+/* S2MM 전송 시작 (buf_base에 FRAME_BYTE_LEN 만큼 기록) */
+static int start_dma_receive(u32 buf_base)
+{
+    u32 Status;
+
+    xil_printf("Starting DMA receive: buf=0x%08lx, len=%lu bytes\r\n",
+               buf_base, (u32)FRAME_BYTE_LEN);
+
+    /* DMA가 DDR에 새 데이터를 쓸 것이므로, 미리 캐시 무효화 */
+    Xil_DCacheInvalidateRange(buf_base, FRAME_BYTE_LEN);
+
+    Status = XAxiDma_SimpleTransfer(
+                 &AxiDma,
+                 (UINTPTR)buf_base,
+                 (u32)FRAME_BYTE_LEN,
+                 XAXIDMA_DEVICE_TO_DMA);
+
+    if (Status != XST_SUCCESS) {
+        xil_printf("XAxiDma_SimpleTransfer failed! status=%lu\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    return XST_SUCCESS;
+}
+
+/* DMA 완료 대기 + 에러 체크 */
+static int wait_for_dma_done(void)
+{
+    xil_printf("Waiting for DMA to finish...\r\n");
+
+    while (1) {
+        u32 s2mm_sr =
+            XAxiDma_ReadReg(AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                            XAXIDMA_SR_OFFSET);
+
+        if (s2mm_sr & XAXIDMA_ERR_ALL_MASK) {
+            xil_printf("DMA error! S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+
+            /* 에러 플래그 클리어 */
+            XAxiDma_WriteReg(AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                             XAXIDMA_SR_OFFSET,
+                             s2mm_sr | XAXIDMA_ERR_ALL_MASK);
+            return XST_FAILURE;
+        }
+
+        if (!XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+            xil_printf("DMA completed. S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+            break;
+        }
+    }
+
+    return XST_SUCCESS;
+}
+
+/* 디버그용: 프레임 내용 UART로 출력 */
+static void print_frame_debug(u32 buf_base, u32 frame_index)
+{
+    u32 *buf = (u32 *)buf_base;
+
+    xil_printf("Frame %lu, %d samples (raw/code/mV):\r\n",
+               frame_index, (int)FRAME_SAMPLES);
+
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        u32 raw = buf[i];
+        int32_t code = adc_code_from_raw(raw);
+        int32_t mv   = adc_code_to_mv(code);
+
+        xil_printf("[%2lu] raw=0x%08lx  code=%7ld  Vdiff=%4ld mV\r\n",
+                   i, raw, code, mv);
+    }
+}
+
+/* DMA가 쓴 프레임 처리 (지금은 디버그 출력만) */
+static void handle_frame(u32 buf_base, u32 frame_index)
+{
+    /* DMA가 DDR에 쓴 후 CPU가 읽으므로, 읽기 전에 캐시 무효화 */
+    Xil_DCacheInvalidateRange(buf_base, FRAME_BYTE_LEN);
+
+    print_frame_debug(buf_base, frame_index);
+}
+
+/* 디버깅용: 시작 전에 버퍼를 패턴으로 채워 두기 */
+static void fill_buffer_pattern(u32 buf_base)
+{
+    u32 *buf = (u32 *)buf_base;
+    xil_printf("Filling RX buffer with pattern 0xAAAAAAAA...\r\n");
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        buf[i] = 0xAAAAAAAAU;
+    }
+    Xil_DCacheFlushRange(buf_base, FRAME_BYTE_LEN);
+}
+
+/* ====== UDP 송신: 한 프레임을 그대로 UDP 패킷으로 보내기 ====== */
+
+static void send_frame_udp(u32 buf_base, u32 frame_index)
+{
+    if (!udp_tx_pcb) {
+        xil_printf("UDP PCB not initialized!\r\n");
+        return;
+    }
+
+    /* 헤더 8바이트("AD96" + frame_index) + 프레임 데이터 */
+    const u16_t payload_len = 8 + FRAME_BYTE_LEN;
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, payload_len, PBUF_RAM);
+    if (!p) {
+        xil_printf("pbuf_alloc failed\r\n");
+        return;
+    }
+
+    u8_t *payload = (u8_t *)p->payload;
+
+    /* 1) 매직 헤더 "AD96" */
+    payload[0] = 'A';
+    payload[1] = 'D';
+    payload[2] = '9';
+    payload[3] = '6';
+
+    /* 2) frame_index (little-endian) */
+    payload[4] = (u8_t)(frame_index & 0xFF);
+    payload[5] = (u8_t)((frame_index >> 8) & 0xFF);
+    payload[6] = (u8_t)((frame_index >> 16) & 0xFF);
+    payload[7] = (u8_t)((frame_index >> 24) & 0xFF);
+
+    /* 3) DDR에 있는 샘플 8개(32bit씩) 그대로 복사 */
+    memcpy(&payload[8], (void *)buf_base, FRAME_BYTE_LEN);
+
+    err_t err = udp_send(udp_tx_pcb, p);
+    if (err != ERR_OK) {
+        xil_printf("udp_send failed, err = %d\r\n", err);
+    }
+
+    pbuf_free(p);
+}
+
+/* ====== main: lwIP 초기화 + DMA + UDP 연속 송신 루프 ====== */
+
+int main()
+{
+#if LWIP_IPV6==0
+    ip_addr_t ipaddr, netmask, gw;
+#endif
+
+    /* 보드 MAC 주소 (보드마다 유니크하면 더 좋음) */
+    unsigned char mac_ethernet_address[] =
+        { 0x00, 0x0a, 0x35, 0x00, 0x01, 0x02 };
+
+    echo_netif = &server_netif;
+
+    init_platform();
+
+#if LWIP_IPV6==0
+#if LWIP_DHCP==1
+    ipaddr.addr = 0;
+    gw.addr = 0;
+    netmask.addr = 0;
+#else
+    /* Zynq 보드 IP = 192.168.1.10 */
+    IP4_ADDR(&ipaddr,  192, 168,   1, 10);
+    IP4_ADDR(&netmask, 255, 255, 255,  0);
+    IP4_ADDR(&gw,      192, 168,   1,  1);
+#endif
+#endif
+
+    xil_printf("==== AD7960 + AXI DMA + lwIP UDP sender (FRAME_SAMPLES=%d) ====\r\n",
+               (int)FRAME_SAMPLES);
+
+    lwip_init();
+
+#if (LWIP_IPV6 == 0)
+    if (!xemac_add(echo_netif, &ipaddr, &netmask,
+                   &gw, mac_ethernet_address,
+                   PLATFORM_EMAC_BASEADDR)) {
+        xil_printf("Error adding N/W interface\n\r");
+        return -1;
+    }
+#else
+    if (!xemac_add(echo_netif, NULL, NULL, NULL,
+                   mac_ethernet_address,
+                   PLATFORM_EMAC_BASEADDR)) {
+        xil_printf("Error adding N/W interface\n\r");
+        return -1;
+    }
+    echo_netif->ip6_autoconfig_enabled = 1;
+
+    netif_create_ip6_linklocal_address(echo_netif, 1);
+    netif_ip6_addr_set_state(echo_netif, 0, IP6_ADDR_VALID);
+#endif
+
+    netif_set_default(echo_netif);
+
+    platform_enable_interrupts();
+    netif_set_up(echo_netif);
+
+#if (LWIP_IPV6 == 0)
+#if (LWIP_DHCP==1)
+    /* DHCP 쓰면 여기서 IP 얻어오는데, 지금은 static IP를 쓰는 걸 권장 */
+    dhcp_start(echo_netif);
+    dhcp_timoutcntr = 24;
+
+    while(((echo_netif->ip_addr.addr) == 0) && (dhcp_timoutcntr > 0))
+        xemacif_input(echo_netif);
+
+    if (dhcp_timoutcntr <= 0) {
+        if ((echo_netif->ip_addr.addr) == 0) {
+            xil_printf("DHCP Timeout\r\n");
+            xil_printf("Configuring default IP of 192.168.1.10\r\n");
+            IP4_ADDR(&(echo_netif->ip_addr),  192, 168,   1, 10);
+            IP4_ADDR(&(echo_netif->netmask), 255, 255, 255,  0);
+            IP4_ADDR(&(echo_netif->gw),      192, 168,   1,  1);
+        }
+    }
+
+    ipaddr.addr = echo_netif->ip_addr.addr;
+    gw.addr = echo_netif->gw.addr;
+    netmask.addr = echo_netif->netmask.addr;
+#endif
+
+    print_ip_settings(&ipaddr, &netmask, &gw);
+#endif
+
+    /* ===== DMA 초기화 ===== */
+    if (init_dma() != XST_SUCCESS) {
+        xil_printf("init_dma failed\r\n");
+        return -1;
+    }
+    reset_s2mm();
+
+    /* ===== UDP TX PCB 초기화 (목적지: H4) =====
+     * H4 IP를 192.168.1.20/24 로 설정했다고 가정.
+     * 다르면 아래 IP4_ADDR만 바꿔주면 됨.
+     */
+    udp_tx_pcb = udp_new();
+    if (!udp_tx_pcb) {
+        xil_printf("udp_new failed\r\n");
+        return -1;
+    }
+    IP4_ADDR(&dest_ip, 192, 168, 1, 20);  /* <<< H4 IP 맞게 수정해도 됨 */
+    udp_connect(udp_tx_pcb, &dest_ip, dest_port);
+    xil_printf("UDP TX ready. Dest = %d.%d.%d.%d:%d\r\n",
+               ip4_addr1(&dest_ip),
+               ip4_addr2(&dest_ip),
+               ip4_addr3(&dest_ip),
+               ip4_addr4(&dest_ip),
+               dest_port);
+
+    /* ===== 반복 DMA + UDP 송신 루프 ===== */
+
+    u32 cur_buf = RX_BUFFER_BASE_A;
+    u32 frame_index = 0;
+
+    while (1) {
+        /* lwIP 타이머 처리 (TCP 안 써도 ARP 등에 도움) */
+        if (TcpFastTmrFlag) {
+            tcp_fasttmr();
+            TcpFastTmrFlag = 0;
+        }
+        if (TcpSlowTmrFlag) {
+            tcp_slowtmr();
+            TcpSlowTmrFlag = 0;
+        }
+
+        /* 이더넷 입력 처리 (ARP 등) */
+        xemacif_input(echo_netif);
+
+        xil_printf("\r\n--- Start frame %lu, buffer 0x%08lx ---\r\n",
+                   frame_index, cur_buf);
+
+        fill_buffer_pattern(cur_buf);
+
+        if (start_dma_receive(cur_buf) != XST_SUCCESS) {
+            xil_printf("start_dma_receive failed\r\n");
+            continue;
+        }
+
+        if (wait_for_dma_done() != XST_SUCCESS) {
+            xil_printf("wait_for_dma_done failed\r\n");
+            continue;
+        }
+
+        handle_frame(cur_buf, frame_index);      /* UART 디버그 */
+        send_frame_udp(cur_buf, frame_index);    /* H4로 UDP 전송 */
+
+        /* 더블 버퍼 스왑 */
+        if (cur_buf == RX_BUFFER_BASE_A)
+            cur_buf = RX_BUFFER_BASE_B;
+        else
+            cur_buf = RX_BUFFER_BASE_A;
+
+        frame_index++;
+    }
+
+    /* 도달하지 않음 */
+    cleanup_platform();
+    return 0;
+}

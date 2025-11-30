@@ -1,0 +1,104 @@
+#include "xparameters.h"
+#include "xaxidma.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+
+#define RX_BUFFER_BASE      (XPAR_DDR_MEM_BASEADDR + 0x01000000)   // DDR + 16MB
+#define NUM_SAMPLES         4096
+#define BYTES_PER_SAMPLE    4
+#define DMA_TRANSFER_SIZE   (NUM_SAMPLES * BYTES_PER_SAMPLE)
+
+XAxiDma AxiDma;
+
+/* ---------------- DMA 초기화 ---------------- */
+int init_dma(void)
+{
+    int Status;
+    XAxiDma_Config *CfgPtr;
+
+    xil_printf("Initializing DMA...\r\n");
+
+    CfgPtr = XAxiDma_LookupConfig(XPAR_AXIDMA_0_DEVICE_ID);
+    if (!CfgPtr) {
+        xil_printf("No DMA config found!\r\n");
+        return XST_FAILURE;
+    }
+
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA init failed!\r\n");
+        return XST_FAILURE;
+    }
+
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("Error: SG mode enabled! Should be Simple Mode!\r\n");
+        return XST_FAILURE;
+    }
+
+    xil_printf("DMA init OK.\r\n");
+    xil_printf("DMA Base Address = 0x%x\r\n", AxiDma.RegBase);
+
+    return XST_SUCCESS;
+}
+
+/* ---------------- S2MM 리셋 ---------------- */
+void reset_s2mm(void)
+{
+    xil_printf("Resetting S2MM channel...\r\n");
+
+    XAxiDma_Reset(&AxiDma);
+    while (!XAxiDma_ResetIsDone(&AxiDma)) {
+        /* wait */
+    }
+
+    xil_printf("S2MM reset done.\r\n");
+}
+
+/* ---------------- DMA 수신 시작 + 상태 출력 ---------------- */
+int start_dma_receive(void)
+{
+    int Status;
+
+    // DMA가 데이터를 DDR에 쓰기 전에 캐시 flush
+    Xil_DCacheFlushRange(RX_BUFFER_BASE, DMA_TRANSFER_SIZE);
+
+    xil_printf("Starting DMA receive of %d bytes...\r\n", DMA_TRANSFER_SIZE);
+
+    Status = XAxiDma_SimpleTransfer(
+                &AxiDma,
+                (UINTPTR)RX_BUFFER_BASE,
+                DMA_TRANSFER_SIZE,
+                XAXIDMA_DEVICE_TO_DMA);   // PS ← PL 방향
+
+    xil_printf("SimpleTransfer return = %d\r\n", Status);
+
+    // S2MM status 레지스터 읽기
+    u32 s2mm_status = XAxiDma_ReadReg(
+                          AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                          XAXIDMA_SR_OFFSET);
+    xil_printf("S2MM status reg = 0x%08lx\r\n", s2mm_status);
+
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA transfer setup failed!\r\n");
+        return XST_FAILURE;
+    }
+
+    return XST_SUCCESS;
+}
+
+/* ---------------- main ---------------- */
+int main(void)
+{
+    if (init_dma() != XST_SUCCESS)
+        return -1;
+
+    reset_s2mm();
+
+    start_dma_receive();
+
+    while (1) {
+        // 여기서는 그냥 멈춰둔다. 나중에 DMA 완료 대기/데이터 출력 추가 예정.
+    }
+
+    return 0;
+}

@@ -1,0 +1,197 @@
+#include "xaxidma.h"
+#include "xparameters.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "xstatus.h"
+
+#define DMA_DEV_ID          XPAR_AXIDMA_0_DEVICE_ID
+
+#define ADC_VREF_MV   4096      // 4.096V → 4096mV
+#define ADC_FS_DIV    131072    // 2^(18-1)
+
+
+
+// 안전한 DDR 영역 하나를 직접 지정 (4KB/4byte 정렬)
+#define RX_BUFFER_BASE      0x01000000U
+#define NUM_SAMPLES         4095U
+#define BYTES_PER_SAMPLE    4U
+#define DMA_TRANSFER_SIZE   (NUM_SAMPLES * BYTES_PER_SAMPLE)   // 16384 bytes
+
+static XAxiDma AxiDma;
+
+int init_dma(void)
+{
+    int Status;
+    XAxiDma_Config *CfgPtr;
+
+    xil_printf("Initializing DMA...\r\n");
+
+    CfgPtr = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (CfgPtr == NULL) {
+        xil_printf("No DMA config found!\r\n");
+        return XST_FAILURE;
+    }
+
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA init failed! status = %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("Error: DMA is in SG mode! Need Simple mode.\r\n");
+        return XST_FAILURE;
+    }
+
+    xil_printf("DMA init OK.\r\n");
+    xil_printf("DMA Base Address = 0x%08lx\r\n", AxiDma.RegBase);
+
+    return XST_SUCCESS;
+}
+
+void reset_s2mm(void)
+{
+    xil_printf("Resetting S2MM channel...\r\n");
+
+    XAxiDma_Reset(&AxiDma);
+    while (!XAxiDma_ResetIsDone(&AxiDma)) {
+        // busy wait
+    }
+
+    xil_printf("S2MM reset done.\r\n");
+}
+
+int start_dma_receive(void)
+{
+    u32 Status;
+    u32 S2mmSr;
+
+    xil_printf("RX_BUFFER_BASE = 0x%08lx, LEN = %lu\r\n",
+               (u32)RX_BUFFER_BASE, (u32)DMA_TRANSFER_SIZE);
+
+    // S2MM: 전송 전에는 flush 안 해도 되지만, 안전하게 유지
+    Xil_DCacheFlushRange(RX_BUFFER_BASE, DMA_TRANSFER_SIZE);
+
+    xil_printf("Starting DMA receive of %d bytes...\r\n", DMA_TRANSFER_SIZE);
+
+    // 실제 DMA 시작
+    Status = XAxiDma_SimpleTransfer(
+                 &AxiDma,
+                 (UINTPTR)RX_BUFFER_BASE,
+                 DMA_TRANSFER_SIZE,
+                 XAXIDMA_DEVICE_TO_DMA    // Stream→Memory
+             );
+
+    xil_printf("SimpleTransfer return = %lu\r\n", Status);
+
+    S2mmSr = XAxiDma_ReadReg(
+                 AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                 XAXIDMA_SR_OFFSET
+             );
+    xil_printf("S2MM status reg = 0x%08lx\r\n", S2mmSr);
+
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA transfer setup failed! (XST_INVALID_PARAM=%d)\r\n",
+                   XST_INVALID_PARAM);
+        return XST_FAILURE;
+    }
+
+    return XST_SUCCESS;
+}
+
+void wait_for_dma_done(void)
+{
+    xil_printf("Waiting for DMA to finish...\r\n");
+
+    // Busy 비트가 0이 될 때까지 기다림
+    while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+        // 아무 것도 안 함 (폴링)
+    }
+
+    // 최종 상태 레지스터 다시 읽어서 찍어보기
+    u32 s2mm_sr = XAxiDma_ReadReg(
+                      AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                      XAXIDMA_SR_OFFSET);
+    xil_printf("DMA done. Final S2MM status reg = 0x%08lx\r\n", s2mm_sr);
+}
+
+void print_rx_data(void)
+{
+    u32 *buf = (u32 *)RX_BUFFER_BASE;
+
+    xil_printf("First 16 samples in DDR:\r\n");
+    for (int i = 0; i < 16; i++) {
+        xil_printf("[%2d] 0x%08lx\r\n", i, buf[i]);
+    }
+}
+
+void print_decoded_samples(void)
+{
+    u32 *buf = (u32 *)RX_BUFFER_BASE;
+
+    xil_printf("Decode first 16 samples (lower/upper 18 bits):\r\n");
+
+    for (int i = 0; i < 16; i++) {
+        u32 raw = buf[i];
+
+        // 하위 18비트 가정 (bits[17:0])
+        u32 low18  =  raw        & 0x3FFFF;
+
+        // 상위 18비트 가정 (bits[31:14])
+        u32 high18 = (raw >> 14) & 0x3FFFF;
+
+        xil_printf("[%2d] raw=0x%08lx  low18=0x%05lx  high18=0x%05lx\r\n",
+                   i, raw, low18, high18);
+    }
+}
+
+int32_t adc_code_from_raw(u32 raw)
+{
+    u32 code18 = raw & 0x3FFFF;
+
+    if (code18 & 0x20000) {
+        return (int32_t)(code18 | ~0x3FFFF);
+    } else {
+        return (int32_t)code18;
+    }
+}
+
+void print_voltage_samples(void)
+{
+    u32 *buf = (u32 *)RX_BUFFER_BASE;
+
+    xil_printf("First 16 samples as code & voltage:\r\n");
+    for (int i = 0; i < 16; i++) {
+        u32 raw = buf[i];
+        int32_t code = adc_code_from_raw(raw);
+
+        // code → mV (정수)  여기서 32bit 안에서 충분히 계산 가능
+        int32_t v_mv = (int32_t)((int64_t)code * ADC_VREF_MV / ADC_FS_DIV);
+
+        xil_printf("[%2d] raw=0x%08lx  code=%6ld  Vdiff=%ld mV\r\n",
+                   i, raw, code, v_mv);
+    }
+}
+int main(void)
+{
+    if (init_dma() != XST_SUCCESS) {
+        xil_printf("init_dma failed\r\n");
+        return XST_FAILURE;
+    }
+
+    reset_s2mm();
+
+    if (start_dma_receive() != XST_SUCCESS) {
+        xil_printf("start_dma_receive failed\r\n");
+    }
+
+    wait_for_dma_done();
+    print_rx_data();
+    print_decoded_samples();
+    print_voltage_samples();
+
+    while (1) {
+    }
+
+    return 0;
+}

@@ -1,0 +1,26 @@
+timestamp=[2025-11-29 12:39:48], mode=WORKBENCH_START, duration=0:00:05.298, duration_ms=5298, data={}
+timestamp=[2025-11-29 12:39:49], mode=WORKBENCH_UI_INIT, duration=0:00:00.431, duration_ms=431, data={editors_count=0, platform_editors_count=0, projects_count=0, platform_projects_count=0, active_platform_editor=false, projects=}
+timestamp=[2025-11-29 12:39:51], mode=PLATFORM_REPOSITORY_INIT, duration=0:00:01.111, duration_ms=1111, data={}
+timestamp=[2025-11-29 12:41:29], mode=APP_CREATION, duration=0:00:32.696, duration_ms=32696, data={name=test, project_type=sdk, os=standalone, processor=psu_cortexa53, runtime=cpp, platform=design_1_wrapper_3, application_type=application}
+timestamp=[2025-11-29 12:42:48], mode=PLATFORM_GENERATION, duration=0:01:03.420, duration_ms=63420, data={name=design_1_wrapper_3}
+timestamp=[2025-11-29 12:42:49], mode=BUILD, duration=0:00:01.286, duration_ms=1286, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 12:42:59], mode=BUILD, duration=0:00:08.963, duration_ms=8963, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 12:47:44], mode=BUILD, duration=0:00:00.898, duration_ms=898, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 12:47:52], mode=BUILD, duration=0:00:07.329, duration_ms=7329, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 14:35:15], mode=BUILD, duration=0:00:01.050, duration_ms=1050, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 14:35:28], mode=BUILD, duration=0:00:12.499, duration_ms=12499, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 14:46:53], mode=BUILD, duration=0:00:01.159, duration_ms=1159, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 14:47:06], mode=BUILD, duration=0:00:12.052, duration_ms=12052, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:15:07], mode=BUILD, duration=0:00:00.381, duration_ms=381, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:43:29], mode=PLATFORM_GENERATION, duration=0:00:33.893, duration_ms=33893, data={name=design_1_wrapper_3}
+timestamp=[2025-11-29 16:43:30], mode=BUILD, duration=0:00:00.254, duration_ms=254, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:54:57], mode=BUILD, duration=0:00:00.348, duration_ms=348, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:55:09], mode=BUILD, duration=0:00:00.303, duration_ms=303, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:57:25], mode=BUILD, duration=0:00:00.328, duration_ms=328, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:59:28], mode=PLATFORM_GENERATION, duration=0:00:03.494, duration_ms=3494, data={name=design_1_wrapper_3}
+timestamp=[2025-11-29 16:59:29], mode=BUILD, duration=0:00:00.310, duration_ms=310, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:59:30], mode=BUILD, duration=0:00:00.333, duration_ms=333, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:59:31], mode=BUILD, duration=0:00:00.354, duration_ms=354, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 16:59:34], mode=BUILD, duration=0:00:00.351, duration_ms=351, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 17:01:28], mode=BUILD, duration=0:00:00.337, duration_ms=337, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 17:01:46], mode=BUILD, duration=0:00:00.278, duration_ms=278, data={name=test, configuration=Debug, clean_build=false}

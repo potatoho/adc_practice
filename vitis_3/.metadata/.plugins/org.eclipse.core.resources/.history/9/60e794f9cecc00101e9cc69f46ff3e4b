@@ -1,0 +1,490 @@
+#include "xaxidma.h"
+#include "xparameters.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "xstatus.h"
+#include "xil_io.h"
+#include <string.h>
+
+// ================== 설정 상수 ==================
+
+#define DMA_DEV_ID          XPAR_AXIDMA_0_DEVICE_ID
+
+// AD7960 관련 (Vref=4.096V, 18bit bipolar 가정)
+#define ADC_VREF_MV   4096      // 4.096V → 4096mV
+#define ADC_FS_DIV    131072    // 2^(18-1)
+
+// 프레임당 샘플 수
+#define FRAME_SAMPLES       8U
+#define BYTES_PER_SAMPLE    4U
+#define FRAME_BYTE_LEN      (FRAME_SAMPLES * BYTES_PER_SAMPLE)
+
+// DDR 버퍼 베이스 주소 (더블버퍼: A/B 두 개 사용)
+#define RX_BUFFER_BASE_A    0x01000000U
+#define RX_BUFFER_BASE_B    (RX_BUFFER_BASE_A + FRAME_BYTE_LEN)
+
+// ================== 전역 변수 ==================
+#include "xaxidma.h"
+#include "xparameters.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "xstatus.h"
+#include "xil_io.h"
+#include <string.h>
+
+// ================== 설정 상수 ==================
+
+#define DMA_DEV_ID          XPAR_AXIDMA_0_DEVICE_ID
+
+// AD7960 관련 (Vref=4.096V, 18bit bipolar 가정)
+#define ADC_VREF_MV   4096      // 4.096V → 4096mV
+#define ADC_FS_DIV    131072    // 2^(18-1)
+
+// 프레임당 샘플 수
+#define FRAME_SAMPLES       8U
+#define BYTES_PER_SAMPLE    4U
+#define FRAME_BYTE_LEN      (FRAME_SAMPLES * BYTES_PER_SAMPLE)
+
+// DDR 버퍼 베이스 주소 (더블버퍼: A/B 두 개 사용)
+#define RX_BUFFER_BASE_A    0x01000000U
+#define RX_BUFFER_BASE_B    (RX_BUFFER_BASE_A + FRAME_BYTE_LEN)
+
+// ================== 전역 변수 ==================
+
+static XAxiDma AxiDma;
+
+// ================== 유틸: ADC 코드/전압 변환 ==================
+
+static int32_t adc_code_from_raw(u32 raw)
+{
+    // 하위 18비트 사용
+    u32 code18 = raw & 0x3FFFFU;
+
+    // sign extend
+    if (code18 & 0x20000U) {
+        return (int32_t)(code18 | ~0x3FFFFU);
+    } else {
+        return (int32_t)code18;
+    }
+}
+
+static int32_t adc_code_to_mv(int32_t code)
+{
+    // code → mV (int64_t로 계산 후 int32_t로 캐스팅)
+    return (int32_t)(((int64_t)code * ADC_VREF_MV) / ADC_FS_DIV);
+}
+
+// ================== DMA 초기화/제어 함수 ==================
+
+static int init_dma(void)
+{
+    int Status;
+    XAxiDma_Config *CfgPtr;
+
+    xil_printf("Initializing DMA...\r\n");
+
+    CfgPtr = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (CfgPtr == NULL) {
+        xil_printf("No DMA config found!\r\n");
+        return XST_FAILURE;
+    }
+
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA init failed! status = %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("Error: DMA is in SG mode! Need Simple mode.\r\n");
+        return XST_FAILURE;
+    }
+
+    xil_printf("DMA init OK.\r\n");
+    xil_printf("DMA Base Address = 0x%08lx\r\n", AxiDma.RegBase);
+
+    return XST_SUCCESS;
+}
+
+static void reset_s2mm(void)
+{
+    xil_printf("Resetting S2MM channel...\r\n");
+
+    XAxiDma_Reset(&AxiDma);
+    while (!XAxiDma_ResetIsDone(&AxiDma)) {
+        // busy wait
+    }
+
+    xil_printf("S2MM reset done.\r\n");
+}
+
+// 버퍼 하나에 대해 S2MM 전송 시작
+static int start_dma_receive(u32 buf_base)
+{
+    u32 Status;
+
+    xil_printf("Starting DMA receive: buf=0x%08lx, len=%lu bytes\r\n",
+               buf_base, (u32)FRAME_BYTE_LEN);
+
+    Status = XAxiDma_SimpleTransfer(
+                 &AxiDma,
+                 (UINTPTR)buf_base,
+                 (u32)FRAME_BYTE_LEN,
+                 XAXIDMA_DEVICE_TO_DMA);
+
+    if (Status != XST_SUCCESS) {
+        xil_printf("XAxiDma_SimpleTransfer failed! status=%lu\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    return XST_SUCCESS;
+}
+
+// S2MM 완료 대기 + 에러 체크
+static int wait_for_dma_done(void)
+{
+    xil_printf("Waiting for DMA to finish...\r\n");
+
+    while (1) {
+        u32 s2mm_sr = XAxiDma_ReadReg(
+                          AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                          XAXIDMA_SR_OFFSET);
+
+        // 에러 비트 체크
+        if (s2mm_sr & (XAXIDMA_ERR_INTERNAL_MASK |
+                       XAXIDMA_ERR_SLAVE_MASK    |
+                       XAXIDMA_ERR_DECODE_MASK)) {
+
+            xil_printf("DMA error! S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+            return XST_FAILURE;
+        }
+
+        // Busy 비트가 0이면 완료
+        if (!XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+            xil_printf("DMA completed. S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+            break;
+        }
+    }
+
+    return XST_SUCCESS;
+}
+
+// ================== 수신한 프레임 처리 ==================
+
+static void print_frame_debug(u32 buf_base, u32 frame_index)
+{
+    u32 *buf = (u32 *)buf_base;
+
+    xil_printf("Frame %lu, %d samples (raw/code/mV):\r\n",
+               frame_index, (int)FRAME_SAMPLES);
+
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        u32 raw = buf[i];
+        int32_t code = adc_code_from_raw(raw);
+        int32_t mv   = adc_code_to_mv(code);
+
+        xil_printf("[%2lu] raw=0x%08lx  code=%7ld  Vdiff=%4ld mV\r\n",
+                   i, raw, code, mv);
+    }
+}
+
+static void handle_frame(u32 buf_base, u32 frame_index)
+{
+    // DMA가 DDR에 쓴 후 CPU가 읽으므로, 읽기 전에 캐시 무효화
+    Xil_DCacheInvalidateRange(buf_base, FRAME_BYTE_LEN);
+
+    // 디버그 출력: 처음 몇 프레임만 (여기서 5프레임으로 제한)
+
+    print_frame_debug(buf_base, frame_index);
+
+
+    // 나중에 여기서 UDP 송신 붙일 예정:
+    // send_frame_udp((const u8 *)buf_base, (u16)FRAME_BYTE_LEN);
+}
+
+// 디버깅용: DMA 시작 전에 패턴 채우기 (DMA가 제대로 덮어쓰는지 확인)
+static void fill_buffer_pattern(u32 buf_base)
+{
+    u32 *buf = (u32 *)buf_base;
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        buf[i] = 0xAAAAAAAAU;
+    }
+    Xil_DCacheFlushRange(buf_base, FRAME_BYTE_LEN);
+}
+
+// ================== main: 반복 DMA + 더블 버퍼 루프 ==================
+
+int main(void)
+{
+    int Status;
+
+    xil_printf("==== AD7960 + AXI DMA continuous capture test (FRAME_SAMPLES=%d) ====\r\n",
+               (int)FRAME_SAMPLES);
+
+    Status = init_dma();
+    if (Status != XST_SUCCESS) {
+        xil_printf("init_dma failed\r\n");
+        return XST_FAILURE;
+    }
+
+    // 더블 버퍼를 번갈아 사용
+    u32 cur_buf = RX_BUFFER_BASE_A;
+    u32 frame_index = 0;
+
+    while (1) {
+        xil_printf("\r\n--- Start frame %lu, buffer 0x%08lx ---\r\n",
+                   frame_index, cur_buf);
+
+        // 디버깅용 패턴 (원하면 주석 처리 가능)
+        xil_printf("Filling RX buffer with pattern 0xAAAAAAAA ...\r\n");
+        fill_buffer_pattern(cur_buf);
+
+        // 매 프레임 시작 전에 S2MM 리셋
+        reset_s2mm();
+
+        Status = start_dma_receive(cur_buf);
+        if (Status != XST_SUCCESS) {
+            xil_printf("start_dma_receive failed\r\n");
+            break;
+        }
+
+        Status = wait_for_dma_done();
+        if (Status != XST_SUCCESS) {
+            xil_printf("wait_for_dma_done failed\r\n");
+            break;
+        }
+
+        handle_frame(cur_buf, frame_index);
+
+        // 다음 프레임에서는 버퍼 A/B 스왑
+        if (cur_buf == RX_BUFFER_BASE_A) {
+            cur_buf = RX_BUFFER_BASE_B;
+        } else {
+            cur_buf = RX_BUFFER_BASE_A;
+        }
+
+        frame_index++;
+    }
+
+    xil_printf("Exiting main due to error.\r\n");
+    return XST_FAILURE;
+}
+
+static XAxiDma AxiDma;
+
+// ================== 유틸: ADC 코드/전압 변환 ==================
+
+static int32_t adc_code_from_raw(u32 raw)
+{
+    // 하위 18비트 사용
+    u32 code18 = raw & 0x3FFFFU;
+
+    // sign extend
+    if (code18 & 0x20000U) {
+        return (int32_t)(code18 | ~0x3FFFFU);
+    } else {
+        return (int32_t)code18;
+    }
+}
+
+static int32_t adc_code_to_mv(int32_t code)
+{
+    // code → mV (int64_t로 계산 후 int32_t로 캐스팅)
+    return (int32_t)(((int64_t)code * ADC_VREF_MV) / ADC_FS_DIV);
+}
+
+// ================== DMA 초기화/제어 함수 ==================
+
+static int init_dma(void)
+{
+    int Status;
+    XAxiDma_Config *CfgPtr;
+
+    xil_printf("Initializing DMA...\r\n");
+
+    CfgPtr = XAxiDma_LookupConfig(DMA_DEV_ID);
+    if (CfgPtr == NULL) {
+        xil_printf("No DMA config found!\r\n");
+        return XST_FAILURE;
+    }
+
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA init failed! status = %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    if (XAxiDma_HasSg(&AxiDma)) {
+        xil_printf("Error: DMA is in SG mode! Need Simple mode.\r\n");
+        return XST_FAILURE;
+    }
+
+    xil_printf("DMA init OK.\r\n");
+    xil_printf("DMA Base Address = 0x%08lx\r\n", AxiDma.RegBase);
+
+    return XST_SUCCESS;
+}
+
+static void reset_s2mm(void)
+{
+    xil_printf("Resetting S2MM channel...\r\n");
+
+    XAxiDma_Reset(&AxiDma);
+    while (!XAxiDma_ResetIsDone(&AxiDma)) {
+        // busy wait
+    }
+
+    xil_printf("S2MM reset done.\r\n");
+}
+
+// 버퍼 하나에 대해 S2MM 전송 시작
+static int start_dma_receive(u32 buf_base)
+{
+    u32 Status;
+
+    xil_printf("Starting DMA receive: buf=0x%08lx, len=%lu bytes\r\n",
+               buf_base, (u32)FRAME_BYTE_LEN);
+
+    Status = XAxiDma_SimpleTransfer(
+                 &AxiDma,
+                 (UINTPTR)buf_base,
+                 (u32)FRAME_BYTE_LEN,
+                 XAXIDMA_DEVICE_TO_DMA);
+
+    if (Status != XST_SUCCESS) {
+        xil_printf("XAxiDma_SimpleTransfer failed! status=%lu\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    return XST_SUCCESS;
+}
+
+// S2MM 완료 대기 + 에러 체크
+static int wait_for_dma_done(void)
+{
+    xil_printf("Waiting for DMA to finish...\r\n");
+
+    while (1) {
+        u32 s2mm_sr = XAxiDma_ReadReg(
+                          AxiDma.RegBase + XAXIDMA_RX_OFFSET,
+                          XAXIDMA_SR_OFFSET);
+
+        // 에러 비트 체크
+        if (s2mm_sr & (XAXIDMA_ERR_INTERNAL_MASK |
+                       XAXIDMA_ERR_SLAVE_MASK    |
+                       XAXIDMA_ERR_DECODE_MASK)) {
+
+            xil_printf("DMA error! S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+            return XST_FAILURE;
+        }
+
+        // Busy 비트가 0이면 완료
+        if (!XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+            xil_printf("DMA completed. S2MM_DMASR=0x%08lx\r\n", s2mm_sr);
+            break;
+        }
+    }
+
+    return XST_SUCCESS;
+}
+
+// ================== 수신한 프레임 처리 ==================
+
+static void print_frame_debug(u32 buf_base, u32 frame_index)
+{
+    u32 *buf = (u32 *)buf_base;
+
+    xil_printf("Frame %lu, %d samples (raw/code/mV):\r\n",
+               frame_index, (int)FRAME_SAMPLES);
+
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        u32 raw = buf[i];
+        int32_t code = adc_code_from_raw(raw);
+        int32_t mv   = adc_code_to_mv(code);
+
+        xil_printf("[%2lu] raw=0x%08lx  code=%7ld  Vdiff=%4ld mV\r\n",
+                   i, raw, code, mv);
+    }
+}
+
+static void handle_frame(u32 buf_base, u32 frame_index)
+{
+    // DMA가 DDR에 쓴 후 CPU가 읽으므로, 읽기 전에 캐시 무효화
+    Xil_DCacheInvalidateRange(buf_base, FRAME_BYTE_LEN);
+
+    // 디버그 출력: 처음 몇 프레임만 (여기서 5프레임으로 제한)
+
+    print_frame_debug(buf_base, frame_index);
+
+
+    // 나중에 여기서 UDP 송신 붙일 예정:
+    // send_frame_udp((const u8 *)buf_base, (u16)FRAME_BYTE_LEN);
+}
+
+// 디버깅용: DMA 시작 전에 패턴 채우기 (DMA가 제대로 덮어쓰는지 확인)
+static void fill_buffer_pattern(u32 buf_base)
+{
+    u32 *buf = (u32 *)buf_base;
+    for (u32 i = 0; i < FRAME_SAMPLES; i++) {
+        buf[i] = 0xAAAAAAAAU;
+    }
+    Xil_DCacheFlushRange(buf_base, FRAME_BYTE_LEN);
+}
+
+// ================== main: 반복 DMA + 더블 버퍼 루프 ==================
+
+int main(void)
+{
+    int Status;
+
+    xil_printf("==== AD7960 + AXI DMA continuous capture test (FRAME_SAMPLES=%d) ====\r\n",
+               (int)FRAME_SAMPLES);
+
+    Status = init_dma();
+    if (Status != XST_SUCCESS) {
+        xil_printf("init_dma failed\r\n");
+        return XST_FAILURE;
+    }
+
+    // 더블 버퍼를 번갈아 사용
+    u32 cur_buf = RX_BUFFER_BASE_A;
+    u32 frame_index = 0;
+
+    while (1) {
+        xil_printf("\r\n--- Start frame %lu, buffer 0x%08lx ---\r\n",
+                   frame_index, cur_buf);
+
+        // 디버깅용 패턴 (원하면 주석 처리 가능)
+        xil_printf("Filling RX buffer with pattern 0xAAAAAAAA ...\r\n");
+        fill_buffer_pattern(cur_buf);
+
+        // 매 프레임 시작 전에 S2MM 리셋
+        reset_s2mm();
+
+        Status = start_dma_receive(cur_buf);
+        if (Status != XST_SUCCESS) {
+            xil_printf("start_dma_receive failed\r\n");
+            break;
+        }
+
+        Status = wait_for_dma_done();
+        if (Status != XST_SUCCESS) {
+            xil_printf("wait_for_dma_done failed\r\n");
+            break;
+        }
+
+        handle_frame(cur_buf, frame_index);
+
+        // 다음 프레임에서는 버퍼 A/B 스왑
+        if (cur_buf == RX_BUFFER_BASE_A) {
+            cur_buf = RX_BUFFER_BASE_B;
+        } else {
+            cur_buf = RX_BUFFER_BASE_A;
+        }
+
+        frame_index++;
+    }
+
+    xil_printf("Exiting main due to error.\r\n");
+    return XST_FAILURE;
+}

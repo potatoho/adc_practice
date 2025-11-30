@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<item key="testt_system-bitFile" value="${project_loc:testt}/_ide/bitstream/design_1_wrapper_3.bit"/>
+	<item key="testt_system-bmmFile" value=""/>
+	<item key="testt_system-target" value="Local"/>
+	<item key="testt_system-device" value="Auto Detect"/>
+	<item key="testt_system-partial_bit" value="false"/>
+	<item key="testt_system-skip_rev_check" value="false"/>
+	<item key="programfpga.sdxproject" value="testt_system"/>
+	<item key="devices_info_Local" value="{&quot;cables&quot;:[{&quot;name&quot;:&quot;Xilinx HW-Z1-ZCU104 FT4232H 61570A&quot;,&quot;indexContextMap&quot;:{&quot;2&quot;:&quot;jsn-HW-Z1-ZCU104 FT4232H-61570A-14730093-0&quot;,&quot;5&quot;:&quot;jsn-HW-Z1-ZCU104 FT4232H-61570A-5ba00477-0&quot;}}]}"/>
+</section>

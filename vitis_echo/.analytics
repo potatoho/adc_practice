@@ -1,0 +1,20 @@
+timestamp=[2025-11-29 17:10:25], mode=WORKBENCH_START, duration=0:00:04.572, duration_ms=4572, data={}
+timestamp=[2025-11-29 17:10:26], mode=WORKBENCH_UI_INIT, duration=0:00:00.377, duration_ms=377, data={editors_count=0, platform_editors_count=0, projects_count=0, platform_projects_count=0, active_platform_editor=false, projects=}
+timestamp=[2025-11-29 17:10:27], mode=PLATFORM_REPOSITORY_INIT, duration=0:00:00.958, duration_ms=958, data={}
+timestamp=[2025-11-29 17:12:17], mode=APP_CREATION, duration=0:00:37.006, duration_ms=37006, data={name=test, project_type=sdk, os=standalone, processor=psu_cortexa53, runtime=cpp, platform=design_1_wrapper_3, application_type=application}
+timestamp=[2025-11-29 17:14:18], mode=PLATFORM_GENERATION, duration=0:01:12.457, duration_ms=72457, data={name=design_1_wrapper_3}
+timestamp=[2025-11-29 17:14:22], mode=BUILD, duration=0:00:04.183, duration_ms=4183, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 17:14:31], mode=BUILD, duration=0:00:08.728, duration_ms=8728, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 17:24:53], mode=BUILD, duration=0:00:01.096, duration_ms=1096, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 17:25:02], mode=BUILD, duration=0:00:08.100, duration_ms=8100, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 20:18:26], mode=BUILD, duration=0:00:01.612, duration_ms=1612, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-29 20:18:35], mode=BUILD, duration=0:00:08.099, duration_ms=8099, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 14:54:40], mode=WORKBENCH_START, duration=0:00:06.022, duration_ms=6022, data={}
+timestamp=[2025-11-30 14:54:41], mode=WORKBENCH_UI_INIT, duration=0:00:00.606, duration_ms=606, data={editors_count=3, platform_editors_count=0, projects_count=4, platform_projects_count=1, active_platform_editor=false, projects=RemoteSystemsTempFiles,design_1_wrapper_3,test,test_system}
+timestamp=[2025-11-30 14:54:43], mode=PLATFORM_REPOSITORY_INIT, duration=0:00:01.049, duration_ms=1049, data={}
+timestamp=[2025-11-30 14:55:00], mode=BUILD, duration=0:00:00.320, duration_ms=320, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 14:55:10], mode=BUILD, duration=0:00:09.886, duration_ms=9886, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 15:04:29], mode=BUILD, duration=0:00:01.555, duration_ms=1555, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 15:04:38], mode=BUILD, duration=0:00:07.835, duration_ms=7835, data={name=test_system, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 15:31:35], mode=BUILD, duration=0:00:00.192, duration_ms=192, data={name=test, configuration=Debug, clean_build=false}
+timestamp=[2025-11-30 15:31:42], mode=BUILD, duration=0:00:07.174, duration_ms=7174, data={name=test_system, configuration=Debug, clean_build=false}
